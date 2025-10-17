@@ -1,0 +1,99 @@
+import pandas as pd
+import re
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+from joblib import dump
+
+DATA_PATH = Path("./한국어_단발성_대화_데이터셋.xlsx")
+MODEL_PATH = Path("./emotion_clf.joblib")
+
+def load_and_clean(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path)
+
+    # 1) 표준 컬럼만 사용
+    #   - 관찰 결과 주요 텍스트/라벨은 Sentence, Emotion
+    #   - 그 외 Unnamed, 숫자 컬럼 등은 드랍
+    keep_cols = []
+    for col in df.columns:
+        col_str = str(col)
+        if col_str.strip() in ["Sentence", "Emotion"]:
+            keep_cols.append(col)
+    if not keep_cols:
+        raise ValueError("필요한 열(Sentence, Emotion)을 찾지 못했습니다.")
+
+    df = df[keep_cols].copy()
+
+    # 2) NaN/공백 정리
+    df["Sentence"] = df["Sentence"].astype(str).map(lambda x: x.strip())
+    df["Emotion"] = df["Emotion"].astype(str).map(lambda x: x.strip())
+
+    df = df[(df["Sentence"] != "") & (df["Emotion"] != "")]
+    df = df.dropna(subset=["Sentence", "Emotion"])
+
+    # 3) 라벨 정규화 (예: 띄어쓰기/대소문자/이모지 등)
+    #    데이터셋에 따라 감정명이 다를 수 있어 최소 변환만 적용
+    normalize = {
+        "분노": "분노",
+        "화남": "분노",
+        "공포": "공포",
+        "두려움": "공포",
+        "슬픔": "슬픔",
+        "기쁨": "기쁨",
+        "행복": "기쁨",
+        "놀람": "놀람",
+        "중립": "중립",
+        "무감정": "중립",
+    }
+    df["Emotion"] = df["Emotion"].map(lambda x: normalize.get(x, x))
+
+    # 너무 희귀한 라벨 제거(샘플이 적으면 모델이 불안정)
+    vc = df["Emotion"].value_counts()
+    rare = set(vc[vc < 10].index)  # 임계치 10
+    if rare:
+        df = df[~df["Emotion"].isin(rare)]
+
+    return df
+
+def train_model(df: pd.DataFrame):
+    X = df["Sentence"].values
+    y = df["Emotion"].values
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.1, random_state=42, stratify=y
+    )
+
+    pipe = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            tokenizer=None,  # 한국어에선 형태소 분석기 써도 되지만 간단히 문자 n-gram
+            ngram_range=(1, 3),
+            min_df=3,
+            max_df=0.95,
+        )),
+        ("clf", LogisticRegression(
+            max_iter=200,
+            n_jobs=None,
+            C=2.0,
+            class_weight="balanced"
+        ))
+    ])
+
+    pipe.fit(X_train, y_train)
+
+    y_pred = pipe.predict(X_val)
+    print(classification_report(y_val, y_pred, digits=4))
+
+    return pipe
+
+def main():
+    df = load_and_clean(DATA_PATH)
+    print("데이터 크기:", df.shape, "라벨 분포:\n", df["Emotion"].value_counts())
+    model = train_model(df)
+    dump(model, MODEL_PATH)
+    print("모델 저장 완료:", MODEL_PATH.resolve())
+
+if __name__ == "__main__":
+    main()
