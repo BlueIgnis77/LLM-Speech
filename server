@@ -1,0 +1,147 @@
+import json
+import os
+from typing import Dict
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from better_profanity import profanity
+import regex as re
+
+print(">>> LOADED SERVER MODULE:", __file__)
+
+# -----------------------
+# HOST/PORT
+# -----------------------
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+
+# -----------------------
+# Profanity config
+# -----------------------
+profanity.load_censor_words()
+KOR_BADWORDS = [
+    "씨발", "시발", "씹", "병신", "지랄",
+    "개새끼", "좆", "좃", "니애미", "닥쳐",
+    "fuck", "shit", "bitch", "asshole"
+]
+profanity.add_censor_words(KOR_BADWORDS)
+
+# ---- Korean compound profanity patterns (mask ENTIRE span with asterisks) ----
+KOR_PATTERNS = [
+    # 씨/시 + 발/바 + up to 4 more Korean chars (absorbs: 년/놈/롬/자식/새끼/아/야 ...)
+    r"(?:씨|시)\s*(?:발|바)[가-힣]{0,4}",
+    # 지랄 + tails (하네/하냐/하고...)
+    r"지랄[가-힣]*",
+    # 병신 + tails
+    r"병신[가-힣]*",
+    # 개 새끼 + tails
+    r"개\s*새끼[가-힣]*",
+    # 좆/좃 + (같은)? + up to 4 more
+    r"(?:좆|좃)\s*(?:같은)?\s*[가-힣]{0,4}",
+]
+KOR_REGEXES = [re.compile(p, re.IGNORECASE) for p in KOR_PATTERNS]
+
+# -----------------------
+# Utils
+# -----------------------
+def normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def mask_korean_profanity(text: str) -> str:
+    out = text
+    # multiple passes to catch overlaps
+    for _ in range(4):
+        prev = out
+        for rx in KOR_REGEXES:
+            out = rx.sub(lambda m: "*" * len(m.group(0)), out)
+        if out == prev:
+            break
+    return normalize_spaces(out)
+
+def redact(text: str) -> str:
+    out = text
+    out = re.sub(r"\b(01[016789]-?\d{3,4}-?\d{4})\b", "[전화번호 숨김]", out)
+    out = re.sub(r"\b\d{6}-?\d{7}\b", "[주민등록번호 숨김]", out)
+    out = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[이메일 숨김]", out)
+    return out
+
+# -----------------------
+# Core sanitize
+# -----------------------
+def sanitize_text(text: str) -> Dict[str, str]:
+    raw = text.strip()
+
+    # 1) 한국어 욕설 별표 처리 (통째 흡수)
+    s = mask_korean_profanity(raw)
+
+    # 2) 개인정보 마스킹
+    s = redact(s)
+
+    # 3) 영어/일반 욕설 별표 처리 (better_profanity)
+    s = profanity.censor(s)
+
+    return {
+        "original": raw,
+        "emotion": "미분류",  # 추가 문구/톤 조정 없음
+        "sanitized": normalize_spaces(s),
+    }
+
+# -----------------------
+# FastAPI app (exported as `app`)
+# -----------------------
+class SanitizeReq(BaseModel):
+    text: str
+
+app = FastAPI(title="Realtime Korean Conversation Sanitizer - Asterisk Masking Only")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
+
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "message": "실시간 순화 서버 동작 중",
+        "endpoints": {"docs": "/docs", "sanitize": "/sanitize (POST)", "websocket": "/ws (WebSocket)"},
+        "websocket_hint": f"ws://127.0.0.1:{PORT}/ws",
+        "file": __file__,
+    }
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+@app.post("/sanitize")
+async def sanitize(req: SanitizeReq):
+    return sanitize_text(req.text)
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = await ws.receive_text()
+            try:
+                payload = json.loads(data)
+                text = payload.get("text", "")
+            except Exception:
+                text = data
+            result = sanitize_text(text)
+            await ws.send_text(json.dumps(result, ensure_ascii=False))
+    except WebSocketDisconnect:
+        pass
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n================== SERVER MODE ==================")
+    print(f"SERVER FILE PATH: {__file__}")
+    base = f"http://127.0.0.1:{PORT}" if HOST in ("127.0.0.1", "localhost") else f"http://{HOST}:{PORT}"
+    print(f"REST: {base}/sanitize  (POST)")
+    print(f"WS  : ws://127.0.0.1:{PORT}/ws  (동일PC)")
+    print("문서: " + base + "/docs")
+    print("헬스: " + base + "/healthz")
+    print("================================================\n")
+    uvicorn.run("app_server:app", host=HOST, port=PORT, reload=False)
